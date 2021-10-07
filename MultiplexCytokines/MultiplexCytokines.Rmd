@@ -1,0 +1,326 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Download data.
+```{r}
+setwd('/cloud/project/MultiplexCytokines')
+
+library(xlsx)
+new.healthy <- read.xlsx('Healthy cytokines_170921.xlsx', 1, header = TRUE)
+page1 <- read.xlsx('Cytokine_27plex_Table.xlsx', 1, header = TRUE)
+page2 <- read.xlsx('Cytokine_27plex_Table.xlsx', 2, header = TRUE)
+
+```
+
+Transform data
+```{r}
+library(tidyverse)
+library(reshape2)
+
+# create table of significant cytokines
+sig <- melt(page1,
+            id.vars = c('Group','Cytokine'), 
+            variable.name = 'Patient', value.name = 'Level')
+
+# split patient group
+# extract patient status
+sig$Patient.Status <- str_extract(sig$Patient, '^[:letter:]+')
+# extract patient number
+sig$Patient.Number <- str_extract(sig$Patient, '[:digit:]+$') %>% as.numeric()
+
+# remove NA patient group
+sig <- sig %>% subset(Patient.Status != 'NA')
+
+# add significant group
+sig$Stats <- 'Significant'
+```
+
+```{r}
+# create table of non-significant cytokines
+signo <- melt(page2,
+            id.vars = c('Group','Cytokine'), 
+            variable.name = 'Patient', value.name = 'Level')
+
+# split patient group
+# extract patient status
+signo$Patient.Status <- str_extract(signo$Patient, '^[:letter:]+')
+# extract patient number
+signo$Patient.Number <- str_extract(signo$Patient, '[:digit:]+$') %>% as.numeric()
+
+signo <- signo %>% subset(Patient.Status != 'NA')
+
+signo$Stats <- 'Insignificant'
+```
+
+```{r}
+# put together
+dat <- rbind(sig,signo)
+
+# divide IL1-ra by 10 in mild, moderate, and severe groups.
+dat$Level <- ifelse(dat$Cytokine == 'IL-1ra' & dat$Patient.Status %in% c('Mild','Moderate','Severe'), dat$Level/10, dat$Level)
+
+# get data of new healthy controls
+# modify new.healthy
+dat.healthy <- melt(new.healthy,
+            id.vars = c('NO'), 
+            variable.name = 'Cytokine', value.name = 'Level')
+
+# change NO column header to Patient
+colnames(dat.healthy)[1] <- 'Patient'
+
+# add Healthy. to digit numbers
+dat.healthy$Patient <- paste0('Healthy.',str_pad(dat.healthy$Patient, 2, pad = "0"))
+
+# change . to - in Cytokine
+dat.healthy$Cytokine <- gsub('\\.','-',dat.healthy$Cytokine)
+
+dat.healthy$Cytokine <- ifelse(dat.healthy$Cytokine == 'FGF-basic', 'FGF basic', dat.healthy$Cytokine)
+
+# split patient group by significant and non-significant cytokines
+# extract patient status
+dat.healthy$Patient.Status <- str_extract(dat.healthy$Patient, '^[:letter:]+')
+# extract patient number
+dat.healthy$Patient.Number <- str_extract(dat.healthy$Patient, '[:digit:]+$') %>% as.numeric()
+
+# make a table of group, cytokine, and significant
+dat.lookup <- dat %>% dplyr::select(Group,Cytokine,Stats) %>% unique()
+
+# add Group and Stats by match()
+dat.healthy$Group <- dat.lookup$Group[match(dat.healthy$Cytokine,dat.lookup$Cytokine)]
+
+dat.healthy$Stats <- dat.lookup$Stats[match(dat.healthy$Cytokine,dat.lookup$Cytokine)]
+
+# subset data from dat by excluding healthy group from old data table
+dat1 <- dat %>% subset(Patient.Status != 'Healthy') %>% dplyr::select(Group, Cytokine, Patient, Level, Patient.Status, Patient.Number, Stats)
+
+dat2 <- dat.healthy %>% subset(Patient.Status == 'Healthy') %>% dplyr::select(Group, Cytokine, Patient, Level, Patient.Status, Patient.Number, Stats)
+
+# combine tables
+dat.new <- rbind(dat2, dat1)
+
+# calculate significant level using Kruskal-Wallis test
+library(broom)
+KW.pval <- dat.new %>% group_by(Cytokine) %>% do(tidy(kruskal.test(x = .$Level, g = .$Patient.Status)))
+
+# which cytokine has KW.pval < 0.05
+sig.cytokines <- KW.pval %>% filter(p.value < 0.05)
+
+signot.cytokines <- KW.pval %>% filter(p.value >= 0.05)
+
+# add new Stats to dat.new table
+dat.new <- dat.new %>% mutate(Stats = case_when(Cytokine %in% sig.cytokines$Cytokine ~ 'Significant',
+                                                Cytokine %in% signot.cytokines$Cytokine ~ 'NotSignificant'))
+
+# add factor levels to significant levels
+dat.new$Stats <- factor(dat.new$Stats, levels = c('Significant','NotSignificant'))
+
+# wrap text of group
+dat.new$Group <- str_wrap(dat.new$Group, width = 20)
+# add factor levels to cytokine groups
+dat.new$Group <- factor(dat.new$Group, levels = c('Cytokines in innate\nimmunity','Cytokines in\nadaptive immunity',
+                                            'Chemokines','Hematopoietic\ncytokines','Growth factors'))
+
+# add factor levels to cytokines
+dat.new$Cytokine <- factor(dat.new$Cytokine, levels = rev(c('TNFa','IL-6','IL-10','IL-1b','IL-12p70','IL-1ra','IL-15',
+                                                  'IL-9','IL-17','IFNg','IL-13','IL-2','IL-4','IL-5',
+                                                  'RANTES','IL-8','MCP-1b','MCP-1','IP-10','Eotaxin','MCP-1a',
+                                                  'IL-7','G-CSF','GM-CSF',
+                                                  'FGF basic','PDGF-bb','VEGF')))
+
+# Dunn's Kruskal-Wallis post-hoc test
+# pairwise comparison
+library(FSA)
+KW.pairwise <- lapply(1:length(unique(dat.new$Cytokine)), function(i) {
+  listCytokine <- unique(dat.new$Cytokine)
+  dat.in <- dat %>% subset(Cytokine == listCytokine[i])
+  posthoc <- dunnTest(Level ~ factor(Patient.Status), data = dat.in, method="holm")
+  posthoc.compare <- as.data.frame(posthoc$res) %>% 
+    subset(Comparison %in% c('Healthy - Mild', 
+                             'Healthy - Moderate', 
+                             'Healthy - Severe'))
+  posthoc.compare$Cytokine <- listCytokine[i]
+  
+  # calculate y_position
+  posthoc.compare$y_position[1] <- max(dat.in$Level) + (1 * quantile(dat.in$Level, c(0.1)))
+  posthoc.compare$y_position[2] <- max(dat.in$Level) + (2 * quantile(dat.in$Level, c(0.1))) 
+  posthoc.compare$y_position[3] <- max(dat.in$Level) + (3 * quantile(dat.in$Level, c(0.1)))
+ 
+  return(posthoc.compare)})
+
+KW.pairwise <- do.call(rbind, KW.pairwise) %>% as.data.frame()
+
+# split Comparison to start/end
+start <- str_split(KW.pairwise$Comparison, ' - ') %>% do.call(rbind,.) %>% as.data.frame() %>% `colnames<-`(.,c('start','end'))
+
+# add to KW.pairwise
+KW.pairwise <- cbind(start,KW.pairwise)
+```
+
+```{r}
+setwd('/cloud/project/MultiplexCytokines')
+# export table
+KW.pairwise.export <- KW.pairwise[,c('Cytokine','Comparison','Z','P.unadj','P.adj')]
+
+write.csv(KW.pairwise.export,'KW_pairwise_table.csv',row.names = FALSE)
+
+KW.pval.export <- KW.pval
+
+write.csv(KW.pval, 'KW_pval.csv', row.names = FALSE)
+```
+
+Draw figure as box-and-whisker plots.
+```{r}
+library(ggpubr)
+
+drawboxplot <- function(datin,statin) {
+ p <- ggplot() +
+  geom_boxplot(data = datin,
+               aes(x = Patient.Status,
+                   y = Level,
+                   color = Patient.Status,
+                   group = Patient.Status)) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+  ) +
+  geom_signif(
+    data = statin,
+    aes(xmin = start, xmax = end, annotations = round(P.adj,digit = 2),y_position = y_position),
+    textsize = 3, vjust = -0.2,
+    map_signif_level = TRUE,
+    manual = TRUE
+  )
+}
+
+# q <- p +  facet_wrap(Group ~ Cytokine,scales = 'free') 
+
+p <- lapply(1:27, function(i) {
+  listCytokine <- unique(dat.new$Cytokine)
+  
+  datin <- dat.new %>% subset(Cytokine == listCytokine[i])
+  KWin <- KW.pairwise %>% subset(Cytokine == listCytokine[i])
+  drawboxplot(datin, KWin) + labs(title = listCytokine[i])
+})
+
+ggarrange(p[[6]],p[[7]],p[[9]],p[[17]],p[[19]], 
+          common.legend = TRUE, legend = 'bottom',
+          nrow = 2, ncol = 3)
+```
+
+Save figure of heatmap.
+```{r}
+setwd('/cloud/project/MultiplexCytokines')
+ggsave(q,
+       filename = 'Figure_Boxplot_MultiplexCytokines_20210921.pdf',
+       height = 22,
+       width = 9,
+       unit = 'in', 
+       dpi = 300,
+       device = cairo_pdf
+)
+```
+
+Draw figure as heatmap
+```{r}
+# calculate median value for expression levels
+# rows = cytokines in groups
+# column = patients in groups
+# facet = significance
+
+# apply scale to the median expression level across patient group for each cytokine
+dat2 <- dat.new %>%
+  group_by(Cytokine) %>%
+  mutate(scaled.Level = as.numeric(scale(Level)))
+
+# calculate median expression level of cytokines
+dat2 <- dat2 %>%
+  group_by(Group, Cytokine, Patient.Status,Stats) %>% 
+  summarise(mean.scaled.Level = mean(scaled.Level),
+            median.scaled.Level = median(scaled.Level))
+
+# add factor levels to significant levels
+dat2$Stats <- factor(dat2$Stats, levels = c('Significant','NotSignificant'))
+
+# wrap group text
+dat2$Group <- str_wrap(dat2$Group, width = 20)
+
+# add factor levels to cytokine groups
+dat2$Group <- factor(dat2$Group, levels = c('Cytokines in innate\nimmunity','Cytokines in\nadaptive immunity',
+                                            'Chemokines','Hematopoietic\ncytokines','Growth factors'))
+
+row.add <- dat2 %>% subset(Cytokine == 'IL-10' & Patient.Status == 'Healthy')
+row.add$Group[1] <- 'Cytokines in\nadaptive immunity'
+
+dat2 <- rbind(dat2,row.add)
+
+dat2$Cytokine <- as.character(dat2$Cytokine)
+
+dat2$Cytokine <- ifelse(dat2$Cytokine == 'IL-10' & dat2$Group == 'Cytokines in\nadaptive immunity', 'IL-10b',
+                        ifelse(dat2$Cytokine == 'IL-10' & dat2$Group == 'Cytokines in innate\nimmunity', 'IL-10a', dat2$Cytokine))
+
+# add factor levels to cytokines
+dat2$Cytokine <- factor(dat2$Cytokine, levels = rev(c('TNFa','IL-1b','IL-1ra','IL-6','IL-10a','IL-12p70','IL-15',
+                                                      'IL-2','IL-4','IL-5','IL-9','IL-10b','IL-13','IL-17','IFNg',
+                                                      'IL-8','IP-10','MCP-1','MCP-1a','MCP-1b','RANTES','Eotaxin',
+                                                      'IL-7','G-CSF','GM-CSF',
+                                                      'FGF basic','PDGF-bb','VEGF')))
+
+# remove IL-10 of adaptive immunity
+dat3 <- dat2 #[-c(which(dat2$Group == 'Cytokines in\nadaptive immunity' & dat2$Cytokine == 'IL-10')),]
+
+```
+
+```{r}
+# plot data
+library(ggpubr)
+out.sig <- ggplot(dat3 %>% subset(Stats == 'Significant'),
+       aes(x = Patient.Status,
+           y = Cytokine)) +
+  geom_tile(aes(fill = mean.scaled.Level), color = 'black') +
+  scale_fill_gradient2(name = 'Normalized \nlevel',
+                       low = '#313695',
+                       mid = '#ffffff',
+                       high = '#a50026') +
+  theme_pubr(legend = 'bottom') +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    strip.text.y.right = element_text(angle = 0),
+    text = element_text(size = 5)
+  ) +
+  labs(x = '', y = '', title = 'Significant group') +
+  facet_grid(Group ~ . ,space = 'free', scales = 'free', labeller = label_wrap_gen(width = 10))
+
+out.notsig <- ggplot(dat3 %>% subset(Stats == 'NotSignificant'),
+       aes(x = Patient.Status,
+           y = Cytokine)) +
+  geom_tile(aes(fill = mean.scaled.Level), color = 'black') +
+  scale_fill_gradient2(name = 'Normalized \nlevel',
+                       low = '#313695',
+                       mid = '#ffffff',
+                       high = '#a50026') +
+  theme_pubr(legend = 'bottom') +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    strip.text.y.right = element_text(angle = 0),
+    text = element_text(size = 5)
+  ) +
+  labs(x = '', y = '', title = 'Not significant group') +
+  facet_grid(Group ~ . ,space = 'free', scales = 'free', labeller = label_wrap_gen(width = 10))
+
+
+out <- ggarrange(out.sig, out.notsig, heights = c(2,1), nrow = 2, ncol = 1, common.legend = TRUE, legend = 'bottom')
+```
+
+Save figure of heatmap.
+```{r}
+setwd('/cloud/project/MultiplexCytokines')
+ggsave(out,
+       filename = 'Figure_Heatmap_MultiplexCytokinesV2_mean.pdf',
+       height = 6.5,
+       width = 2,
+       unit = 'in', 
+       dpi = 300,
+       device = cairo_pdf
+)
+```
